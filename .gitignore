@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.DS_Store
+test1/
+test2/
+release/
+*.mp4
+*.mov
+*.mkv

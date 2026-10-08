@@ -1,0 +1,1341 @@
+# MSPE-V11 Implementation Specification
+
+## 1. 任务
+
+实现一个完整、可运行的 MSPE-V11 媒体处理程序。
+
+程序必须支持：
+
+- `encrypt`
+- `decrypt`
+- 静态图片
+- 视频
+- YUV420p 核心处理
+- 密钥相关的全频域符号变换
+- 密钥相关的低频分带正交混合
+- 图片单帧处理
+- 视频逐帧处理
+- 视频帧级并行
+- 有序输出
+- 可复用工作缓冲区
+- 命令行参数
+
+程序只处理画面。
+
+不处理音频、字幕或其他数据流。
+
+---
+
+# 2. 外部依赖
+
+实现使用：
+
+- NumPy
+- SciPy FFT
+- FFmpeg
+- ffprobe
+
+FFmpeg 和 ffprobe 从系统 PATH 调用。
+
+DCT 和 inverse DCT 使用 SciPy FFT 提供的实现。
+
+---
+
+# 3. 命令行接口
+
+调用形式：
+
+`程序 encrypt 输入文件 输出文件 密钥 [可选参数]`
+
+或：
+
+`程序 decrypt 输入文件 输出文件 密钥 [可选参数]`
+
+第一个位置参数只能为：
+
+- `encrypt`
+- `decrypt`
+
+后续三个位置参数依次为：
+
+- 输入路径
+- 输出路径
+- 用户密钥
+
+支持以下可选参数：
+
+| 参数 | 类型 | 默认值 |
+|---|---:|---:|
+| FFT workers | integer | 0，自动 |
+| pipeline workers | integer | 0，自动 |
+| max inflight frames | integer | 0，自动 |
+| FFmpeg encoder threads | integer | 0，FFmpeg 自动 |
+| max harmonic | integer | 32 |
+| Y gain | float | 0.58 |
+| C gain | float | 0.60 |
+| video codec | string | `libx264` |
+| CRF | integer | 18 |
+| preset | string | `veryfast` |
+| progress interval | integer | 30 |
+
+输入文件不存在时终止。
+
+输出目录不存在时自动创建父目录。
+
+---
+
+# 4. 图片识别
+
+以下输入扩展名视为静态图片：
+
+- `.png`
+- `.jpg`
+- `.jpeg`
+- `.bmp`
+- `.tif`
+- `.tiff`
+- `.webp`
+
+扩展名比较不区分大小写。
+
+如果输入属于静态图片，输出也必须使用上述图片扩展名之一。
+
+其他输入按照视频处理。
+
+如果图片输出格式为：
+
+- JPEG
+- JPG
+- WebP
+
+输出警告，说明有损图片编码可能降低后续恢复质量，并建议使用 PNG、BMP 或 TIFF。
+
+---
+
+# 5. 媒体探测
+
+使用 ffprobe 读取第一个视频流。
+
+读取：
+
+- coded width
+- coded height
+- average frame rate
+- rotation
+
+如果不存在可解码视频流，终止。
+
+rotation 归一化到：
+
+0～359 度。
+
+如果 rotation 为：
+
+- 90
+- 270
+
+则实际处理宽度等于 coded height，实际处理高度等于 coded width。
+
+其他 rotation 值使用原 coded width 和 coded height。
+
+如果最终处理宽度或高度为奇数，终止。
+
+如果 average frame rate：
+
+- 不存在
+- 为空
+- 等于 `0/0`
+
+则使用：
+
+30 fps。
+
+否则按照分数值解析成浮点帧率。
+
+---
+
+# 6. 核心像素格式
+
+所有图片和视频帧在核心算法中都使用：
+
+8-bit planar YUV420p。
+
+设处理宽度为 W，高度为 H。
+
+要求：
+
+W 和 H 都为偶数。
+
+Y 平面：
+
+H × W
+
+Cb 平面：
+
+H/2 × W/2
+
+Cr 平面：
+
+H/2 × W/2
+
+原始帧字节排列严格为：
+
+Y → Cb → Cr
+
+每个样本为 uint8。
+
+单帧字节数：
+
+W×H + 2×(W/2)×(H/2)
+
+即：
+
+3WH/2。
+
+---
+
+# 7. 固定参数
+
+8 位中心值：
+
+128
+
+默认 Y gain：
+
+0.58
+
+默认 C gain：
+
+0.60
+
+默认最大 harmonic：
+
+32
+
+固定标准 band edges：
+
+4、8、16、32
+
+三个平面的域标签分别为 ASCII 字节：
+
+- Y：`Y`
+- Cb：`Cb`
+- Cr：`Cr`
+
+---
+
+# 8. 用户密钥规范化
+
+用户密钥是 Unicode 字符串。
+
+处理步骤：
+
+1. 使用 UTF-8 编码；
+2. 对完整 UTF-8 字节序列计算 SHA-256；
+3. 使用 SHA-256 的原始 32 字节摘要作为 master key。
+
+不要使用摘要的 hexadecimal 文本形式。
+
+所有后续密钥派生只使用这 32 字节 master key。
+
+---
+
+# 9. 有效 harmonic 范围
+
+Y 平面的有效最大 harmonic：
+
+max(2, min(max_harmonic, H, W))
+
+Cb 和 Cr 的有效最大 harmonic：
+
+max(2, min(max_harmonic, H/2, W/2))
+
+Y 使用自己的有效值。
+
+Cb 和 Cr 使用色度平面的有效值。
+
+---
+
+# 10. DCT 定义
+
+二维空间变换使用：
+
+- DCT Type II
+- orthonormal normalization
+
+正向空间到频域：
+
+完整二维 Type-II orthonormal DCT。
+
+频域回到空间：
+
+对应的 orthonormal inverse DCT。
+
+不得使用 block DCT。
+
+每个平面执行 full-plane transform。
+
+Y 在两个空间轴执行。
+
+Cb 和 Cr 也分别在自己的两个空间轴执行。
+
+Cb 和 Cr 可以组成一个 batch，一次调用二维 DCT，但 batch 维度不得参与 DCT。
+
+---
+
+# 11. 全平面符号掩码
+
+Y、Cb、Cr 分别生成独立的 full-plane ±1 DCT mask。
+
+对于某一个平面，设其高度为 PH，宽度为 PW，域标签为 LABEL。
+
+构造固定 prefix：
+
+master key
+
+后接 ASCII：
+
+`|MSPE-V8|STATIC-SIGN|`
+
+后接：
+
+LABEL
+
+后接 ASCII：
+
+`|`
+
+对于每一个频率行：
+
+ky = 0 ... PH-1
+
+构造 seed：
+
+prefix
+
+后接：
+
+ky 的 4 字节 unsigned little-endian 表示。
+
+对 seed 使用 SHAKE-256。
+
+请求：
+
+PW
+
+个原始输出字节。
+
+对于位置 kx：
+
+如果对应 SHAKE 字节最低位为 0：
+
+mask[ky,kx] = +1
+
+否则：
+
+mask[ky,kx] = -1
+
+最后强制：
+
+mask[0,0] = +1。
+
+三个平面独立执行这一过程。
+
+---
+
+# 12. band 列表
+
+对一个有效最大 harmonic M：
+
+初始：
+
+low = 1。
+
+从固定 edge：
+
+4、8、16、32
+
+中保留所有：
+
+edge <= M
+
+的值。
+
+如果最终 edge 列表为空，或者最后一个 edge 不等于 M：
+
+追加 M。
+
+按照 edge 顺序处理。
+
+对于每个 high：
+
+如果：
+
+high <= low
+
+跳过。
+
+否则建立一个 band。
+
+band 完成后：
+
+low = high。
+
+---
+
+# 13. band 坐标
+
+对于一个 band `[low, high)`：
+
+按以下顺序扫描：
+
+ky = 0 ... M-1
+
+对于每个 ky：
+
+kx = 0 ... M-1
+
+计算：
+
+m = max(kx, ky)
+
+如果：
+
+low <= m < high
+
+则将坐标：
+
+(ky,kx)
+
+加入当前 band。
+
+坐标加入顺序必须保持上述 row-major 扫描顺序。
+
+DC `(0,0)` 不属于任何 band。
+
+---
+
+# 14. band 基础派生字节串
+
+每个 band、每个颜色平面独立构造基础派生字节串。
+
+连接顺序：
+
+1. master key
+2. ASCII `|MSPE-V8|BAND|`
+3. 当前平面 LABEL
+4. ASCII `|`
+5. low 的 unsigned 2-byte little-endian
+6. high 的 unsigned 2-byte little-endian
+
+该字节串用于派生：
+
+- 第一置换
+- 第二置换
+- band 符号
+
+---
+
+# 15. 置换派生
+
+假设 band 中共有 n 个坐标。
+
+## 第一置换
+
+基础派生字节串后追加 ASCII：
+
+`|P1`
+
+使用 SHAKE-256 输出：
+
+8n
+
+字节。
+
+从头开始每连续 8 字节解释为一个：
+
+unsigned 64-bit little-endian integer。
+
+共得到 n 个 priority。
+
+按照 priority 从小到大进行 stable sort。
+
+排序后得到的原始位置索引序列就是第一置换。
+
+同时建立它的 inverse permutation。
+
+## 第二置换
+
+过程完全相同，但追加：
+
+`|P2`
+
+得到第二置换以及对应 inverse permutation。
+
+如果 n <= 1：
+
+置换和 inverse permutation 均为 identity。
+
+---
+
+# 16. band 符号派生
+
+基础 band 派生字节串后追加：
+
+`|SIGN`
+
+使用 SHAKE-256 请求：
+
+n
+
+字节。
+
+对于第 i 个字节：
+
+最低位为 0：
+
+sign[i] = +1
+
+最低位为 1：
+
+sign[i] = -1。
+
+符号向量使用 float32。
+
+---
+
+# 17. band 正向变换
+
+对于一个频域系数平面和一个 band：
+
+按照 band 固定坐标顺序提取所有系数，形成长度 n 的向量。
+
+然后严格按照以下顺序：
+
+1. 按第一置换重排向量；
+2. 对整个向量执行一维 Type-II DCT；
+3. 使用 orthonormal normalization；
+4. 逐元素乘 band sign；
+5. 按第二置换重排；
+6. 按原 band 坐标顺序写回二维频域平面。
+
+一维 DCT 使用完整长度 n。
+
+---
+
+# 18. band 逆向变换
+
+按照 band 固定坐标顺序提取向量。
+
+严格执行：
+
+1. 按第二置换的 inverse permutation 重排；
+2. 逐元素乘同一个 band sign；
+3. 执行一维 orthonormal inverse DCT；
+4. 按第一置换的 inverse permutation 重排；
+5. 按原 band 坐标顺序写回二维频域平面。
+
+---
+
+# 19. Y 正向变换
+
+输入：
+
+uint8 Y 平面。
+
+普通路径严格执行：
+
+1. 转换到 float32 工作数组；
+2. 每个样本减 128；
+3. 对完整平面执行二维 Type-II orthonormal DCT；
+4. 整个频域平面逐元素乘 Y full-plane sign mask；
+5. 按 band 从低到高依次执行 Y 的 band 正向变换；
+6. 对完整平面执行二维 orthonormal inverse DCT；
+7. 所有样本乘 Y gain；
+8. 所有样本加 128；
+9. nearest-even rounding；
+10. clip 到 `[0,255]`；
+11. 转换成 uint8。
+
+默认 Y gain：
+
+0.58。
+
+---
+
+# 20. Y 逆向变换
+
+输入：
+
+uint8 Y 平面。
+
+普通路径严格执行：
+
+1. 转换到 float32 工作数组；
+2. 每个样本减 128；
+3. 所有样本除以 Y gain；
+4. 对完整平面执行二维 Type-II orthonormal DCT；
+5. 按 band 从低到高依次执行 Y 的 band 逆向变换；
+6. 整个频域平面逐元素乘 Y full-plane sign mask；
+7. 执行完整二维 orthonormal inverse DCT；
+8. 所有样本加 128；
+9. nearest-even rounding；
+10. clip 到 `[0,255]`；
+11. 转换成 uint8。
+
+---
+
+# 21. 色度正向变换
+
+Cb 和 Cr 转换为两个独立的 float32 平面。
+
+分别减：
+
+128。
+
+允许将两者组成：
+
+2 × H/2 × W/2
+
+的 batch。
+
+对两个空间轴执行二维 Type-II orthonormal DCT。
+
+不得沿第一个 batch 轴进行 DCT。
+
+DCT 后：
+
+Cb 频域平面乘 Cb full-plane mask。
+
+Cr 频域平面乘 Cr full-plane mask。
+
+然后：
+
+Cb 使用自己的 band 数据执行全部正向 band 变换。
+
+Cr 使用自己的 band 数据执行全部正向 band 变换。
+
+随后对两个平面执行二维 orthonormal inverse DCT。
+
+所有 Cb 和 Cr 空间值乘 C gain。
+
+默认：
+
+0.60。
+
+然后：
+
+1. 加 128；
+2. nearest-even rounding；
+3. clip 到 `[0,255]`；
+4. 转换 uint8。
+
+---
+
+# 22. 色度逆向变换
+
+Cb 和 Cr 转换成 float32。
+
+分别：
+
+1. 减 128；
+2. 除以 C gain。
+
+然后执行二维 Type-II orthonormal DCT。
+
+随后：
+
+Cb 使用自己的 band 数据执行全部逆向 band 变换。
+
+Cr 使用自己的 band 数据执行全部逆向 band 变换。
+
+之后：
+
+Cb 乘 Cb full-plane sign mask。
+
+Cr 乘 Cr full-plane sign mask。
+
+随后执行二维 orthonormal inverse DCT。
+
+最后：
+
+1. 加 128；
+2. nearest-even rounding；
+3. clip 到 `[0,255]`；
+4. 转换 uint8。
+
+---
+
+# 23. 常量 Y 平面
+
+如果整个 Y 平面所有 uint8 样本完全相同，可以直接使用常量路径。
+
+设输入常量为 q。
+
+encrypt：
+
+`round(128 + (q - 128) × Y_gain)`
+
+decrypt：
+
+`round(128 + (q - 128) / Y_gain)`
+
+round 使用 nearest-even。
+
+结果 clip 到：
+
+0～255。
+
+整个输出 Y 平面填充该值。
+
+---
+
+# 24. 常量色度平面
+
+只有当：
+
+Cb 整个平面为常量
+
+并且：
+
+Cr 整个平面也为常量
+
+时使用色度常量路径。
+
+设常量分别为 qCb 和 qCr。
+
+encrypt：
+
+Cb：
+
+`round(128 + (qCb - 128) × C_gain)`
+
+Cr：
+
+`round(128 + (qCr - 128) × C_gain)`
+
+decrypt：
+
+Cb：
+
+`round(128 + (qCb - 128) / C_gain)`
+
+Cr：
+
+`round(128 + (qCr - 128) / C_gain)`
+
+所有结果 clip 到：
+
+0～255。
+
+如果只有其中一个色度平面是常量，两个平面都走普通色度变换路径。
+
+---
+
+# 25. 帧处理
+
+输入必须恰好是一整个 raw YUV420p frame。
+
+按照固定布局拆分：
+
+- Y
+- Cb
+- Cr
+
+encrypt 模式：
+
+- Y 执行 Y 正向变换；
+- Cb/Cr 执行色度正向变换。
+
+decrypt 模式：
+
+- Y 执行 Y 逆向变换；
+- Cb/Cr 执行色度逆向变换。
+
+输出仍然按：
+
+Y → Cb → Cr
+
+排列。
+
+输出长度与输入长度完全相同。
+
+---
+
+# 26. 初始化
+
+对于固定：
+
+- W
+- H
+- master key
+- max harmonic
+
+在处理第一帧前预计算：
+
+- Y full-plane sign mask
+- Cb full-plane sign mask
+- Cr full-plane sign mask
+- Y band definitions
+- Cb band definitions
+- Cr band definitions
+- 每个 band 的坐标
+- 第一置换
+- 第一 inverse permutation
+- 第二置换
+- 第二 inverse permutation
+- band sign
+
+这些数据在整个图片或视频任务中重复使用。
+
+不得根据帧号重新生成。
+
+不得根据时间重新生成。
+
+不得进行 epoch rekeying。
+
+---
+
+# 27. 工作数组
+
+每个同时执行帧变换的 worker 必须拥有独立的可写 scratch arrays。
+
+至少包括：
+
+Y float32 工作平面：
+
+H × W
+
+色度 float32 工作数组：
+
+2 × H/2 × W/2
+
+不同 worker 不得同时写同一 scratch array。
+
+预计算得到的只读 masks、band coordinates、permutations 和 signs 可以在 worker 之间共享。
+
+---
+
+# 28. 图片解码
+
+使用 FFmpeg 将图片解码成：
+
+- rawvideo
+- yuv420p
+- 单帧
+
+只使用第一帧。
+
+解码时：
+
+- 不处理音频；
+- 不处理字幕；
+- 不处理数据流。
+
+必须读取恰好一个完整 raw frame。
+
+如果没有得到完整帧，终止。
+
+---
+
+# 29. 图片编码
+
+变换完成后，将一个完整 raw YUV420p frame 输入 FFmpeg。
+
+指定：
+
+- rawvideo input
+- yuv420p
+- 正确 W×H
+- 输出恰好一帧
+
+输出到用户指定图片路径。
+
+编码失败时终止。
+
+---
+
+# 30. 视频解码
+
+使用 FFmpeg：
+
+- 读取输入文件；
+- 选择第一个视频流；
+- 禁用音频；
+- 禁用字幕；
+- 禁用数据流；
+- 输出 rawvideo；
+- 像素格式 yuv420p；
+- 通过 stdout 连续输出 raw frames。
+
+程序从 stdout 按固定 frame size 读取。
+
+如果 EOF 出现在尚未读取任何新帧字节时：
+
+正常结束。
+
+如果 EOF 出现在一个 frame 已读取部分字节之后：
+
+视为异常并终止。
+
+---
+
+# 31. 视频编码
+
+FFmpeg 从 stdin 接收：
+
+- rawvideo
+- yuv420p
+- 指定 W×H
+- 指定源 fps
+
+编码时：
+
+- 不包含音频；
+- codec 默认 `libx264`；
+- preset 默认 `veryfast`；
+- CRF 默认 18；
+- 输出像素格式 yuv420p。
+
+如果用户指定 FFmpeg thread count 大于 0：
+
+显式传递该 thread count。
+
+如果为 0：
+
+让 FFmpeg 自行决定。
+
+如果输出扩展名为：
+
+- `.mp4`
+- `.mov`
+- `.m4v`
+
+启用 fast-start 容器选项。
+
+---
+
+# 32. 帧级并行
+
+视频帧彼此独立，可以并行处理。
+
+pipeline worker 默认值：
+
+`min(4, CPU count)`
+
+且至少为：
+
+1。
+
+如果用户显式指定正数，则使用用户值。
+
+如果结果小于 1，则修正为 1。
+
+---
+
+# 33. FFT worker 自动策略
+
+用户指定的 FFT worker 参数如果不等于 0：
+
+直接使用用户值。
+
+如果为 0：
+
+若：
+
+- pipeline workers >= 3
+- CPU count >= 4
+
+则：
+
+FFT workers per frame = 2。
+
+否则，如果：
+
+pipeline workers > 1
+
+则：
+
+FFT workers per frame = 1。
+
+否则：
+
+让 SciPy FFT 使用全部 CPU worker。
+
+图片处理按：
+
+pipeline workers = 1
+
+解析这一规则。
+
+---
+
+# 34. 最大在途帧
+
+如果用户指定：
+
+max inflight > 0
+
+使用该值。
+
+否则：
+
+max inflight = max(1, pipeline workers × 2)
+
+为每一个在途 slot 准备：
+
+- 一个 raw input byte buffer；
+- 一个 raw output byte buffer。
+
+处理完成后缓冲区返回池中复用。
+
+---
+
+# 35. 并行输出顺序
+
+视频帧可以同时执行变换。
+
+但是编码器接收帧的顺序必须严格等于解码器产生帧的顺序。
+
+任务完成顺序不得改变输出顺序。
+
+维护一个按照提交顺序排列的 pending queue。
+
+需要释放 slot 或 pending 数达到最大值时：
+
+等待并取出 queue 中最早提交的任务。
+
+任务完成后：
+
+1. 将对应 output frame 写给编码器；
+2. input buffer 返回池；
+3. output buffer 返回池；
+4. 增加已完成帧数。
+
+所有输入读取结束后：
+
+按照 pending queue 顺序排空剩余任务。
+
+---
+
+# 36. 单 pipeline worker
+
+如果：
+
+pipeline workers = 1
+
+直接使用串行循环。
+
+重复：
+
+1. 读取一个完整 raw frame；
+2. 执行变换；
+3. 写入编码器；
+4. 增加 frame count。
+
+不需要线程池。
+
+---
+
+# 37. 进度信息
+
+如果 progress interval 非零：
+
+每完成指定数量的帧输出一次：
+
+- frame count
+- 当前端到端平均 fps
+
+平均 fps：
+
+已完成帧数 / 从视频处理开始到当前的 wall-clock elapsed time。
+
+---
+
+# 38. 视频结束信息
+
+视频成功完成后输出：
+
+- encrypt/decrypt 模式
+- resolution
+- input rotation
+- source fps
+- frame count
+- max harmonic
+- band edges
+- Y gain
+- C gain
+- pipeline workers
+- FFT workers per frame
+- max inflight
+- end-to-end fps
+
+---
+
+# 39. 图片结束信息
+
+图片成功完成后输出：
+
+- encrypt/decrypt 模式
+- resolution
+- max harmonic
+- band edges
+- Y gain
+- C gain
+- FFT workers
+
+---
+
+# 40. 错误处理
+
+以下情况必须终止并报告错误：
+
+- 输入文件不存在；
+- ffprobe 不存在；
+- 没有可解码视频流；
+- 实际显示尺寸不是偶数；
+- 图片输入对应的输出不是支持的图片扩展名；
+- 图片解码没有产生帧；
+- raw frame 中途截断；
+- FFmpeg decoder 返回失败；
+- FFmpeg encoder 返回失败。
+
+输出目录可以自动创建。
+
+---
+
+# 41. 浮点与量化要求
+
+核心工作数组使用：
+
+float32。
+
+gain 在核心处理中使用 float32。
+
+full-plane mask 参与频域乘法时使用 float32 的：
+
++1.0
+
+或：
+
+-1.0。
+
+band sign 使用 float32。
+
+最终空间值必须按照：
+
+1. nearest-even rounding
+2. clip 0～255
+3. uint8 conversion
+
+的顺序处理。
+
+---
+
+# 42. 不得加入的状态
+
+核心算法不得使用：
+
+- 帧编号；
+- 时间戳；
+- PTS；
+- DTS；
+- epoch；
+- 随机 nonce；
+- 随机 IV；
+- 每帧 salt；
+- mutable PRNG；
+- 内容 hash；
+- 视频 GOP 状态。
+
+对于相同：
+
+- 分辨率；
+- master key；
+- max harmonic；
+- gain；
+
+每一帧使用完全相同的预计算变换参数。
+
+---
+
+# 43. 必须保持的正向顺序
+
+Y：
+
+**subtract 128  
+→ full-plane 2D orthonormal DCT-II  
+→ full-plane key sign mask  
+→ key-derived band forward transforms  
+→ full-plane orthonormal inverse DCT  
+→ multiply Y gain  
+→ add 128  
+→ nearest-even round  
+→ clip  
+→ uint8**
+
+Cb/Cr 使用完全相同的结构，但：
+
+- 使用各自 mask；
+- 使用各自 band transforms；
+- 使用 C gain。
+
+---
+
+# 44. 必须保持的逆向顺序
+
+Y：
+
+**subtract 128  
+→ divide Y gain  
+→ full-plane 2D orthonormal DCT-II  
+→ key-derived band inverse transforms  
+→ full-plane key sign mask  
+→ full-plane orthonormal inverse DCT  
+→ add 128  
+→ nearest-even round  
+→ clip  
+→ uint8**
+
+Cb/Cr 使用：
+
+- C gain；
+- 各自 band inverse transforms；
+- 各自 full-plane mask。
+
+---
+
+# 45. 必须保持的 band 正向顺序
+
+对于每个 band：
+
+**extract by fixed coordinate order  
+→ P1  
+→ 1D orthonormal DCT-II  
+→ multiply band signs  
+→ P2  
+→ write back by fixed coordinate order**
+
+---
+
+# 46. 必须保持的 band 逆向顺序
+
+对于每个 band：
+
+**extract by fixed coordinate order  
+→ inverse P2  
+→ multiply band signs  
+→ 1D orthonormal inverse DCT  
+→ inverse P1  
+→ write back by fixed coordinate order**
+
+---
+
+# 47. 固定字节协议汇总
+
+Master key：
+
+SHA-256(UTF-8 user key) 的原始 32 字节。
+
+Full-plane mask 固定域文本：
+
+`|MSPE-V8|STATIC-SIGN|`
+
+Band 固定域文本：
+
+`|MSPE-V8|BAND|`
+
+平面标签：
+
+`Y`
+
+`Cb`
+
+`Cr`
+
+Permutation suffix：
+
+`|P1`
+
+`|P2`
+
+Band sign suffix：
+
+`|SIGN`
+
+ky：
+
+4-byte unsigned little-endian。
+
+low：
+
+2-byte unsigned little-endian。
+
+high：
+
+2-byte unsigned little-endian。
+
+Permutation priority：
+
+8-byte unsigned little-endian。
+
+所有 SHAKE 操作：
+
+SHAKE-256。
+
+所有 SHAKE 结果直接使用原始 bytes。
+
+不得转换为 hexadecimal 字符串。
+
+---
+
+# 48. 最终实现要求
+
+最终交付一个完整程序，而不是：
+
+- 伪代码；
+- 示例；
+- 局部实现；
+- 测试程序；
+- 算法说明；
+- TODO 框架。
+
+程序必须完整实现本文档规定的：
+
+- 命令行解析；
+- 文件检查；
+- 媒体探测；
+- 图片路径；
+- 视频路径；
+- 密钥规范化；
+- 三平面域分离；
+- full-plane mask；
+- band 构造；
+- permutation；
+- inverse permutation；
+- band sign；
+- 正向 band transform；
+- 逆向 band transform；
+- Y encrypt/decrypt；
+- Cb/Cr encrypt/decrypt；
+- constant-plane fast path；
+- raw YUV420p frame handling；
+- FFmpeg decode；
+- FFmpeg encode；
+- frame-level pipeline；
+- ordered output；
+- reusable buffers；
+- worker-local float32 scratch；
+- 自动并行参数；
+- progress reporting；
+- error handling。
+
+不要实现任何其他版本。
+
+不要增加本文档没有规定的密码机制。
+
+不要省略性能流水线。
+
+不要改变固定密钥派生字节。
+
+如果某项实现选择没有在本文档中规定，可以自行选择；如果本文档已经规定，则严格按照本文档实现。
