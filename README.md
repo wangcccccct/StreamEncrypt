@@ -36,33 +36,27 @@ python3 -m venv .venv
 
 ## 处理视频
 
-使用 V9 程序处理视频画面：
+使用 V11 程序处理视频画面：
 
 ```bash
-.venv/bin/python mspe_v9_video.py encrypt input.mp4 encrypted.mp4 "your-secret-key"
+.venv/bin/python mspe_v11_media.py encrypt input.mp4 encrypted.mp4 "your-secret-key"
 ```
 
 使用相同密钥尝试恢复画面：
 
 ```bash
-.venv/bin/python mspe_v9_video.py decrypt encrypted.mp4 restored.mp4 "your-secret-key"
+.venv/bin/python mspe_v11_media.py decrypt encrypted.mp4 restored.mp4 "your-secret-key"
 ```
 
 程序根据输出文件扩展名选择 FFmpeg 容器。常用扩展名包括 `.mp4`、`.mov` 和 `.mkv`。
 
 ## 处理单张图片
 
-V9 入口按视频处理方式工作。FFmpeg 可将 PNG 或 JPEG 图片作为单帧输入，输出使用视频容器：
+V11 支持处理静态图片。输入和输出可使用 PNG、JPEG 等支持的图片格式：
 
 ```bash
-.venv/bin/python mspe_v9_video.py encrypt photo.png photo_encrypted.mp4 "your-secret-key"
-.venv/bin/python mspe_v9_video.py decrypt photo_encrypted.mp4 photo_restored.mp4 "your-secret-key"
-```
-
-如需将恢复结果保存为 PNG，可从解密视频导出首帧：
-
-```bash
-ffmpeg -i photo_restored.mp4 -frames:v 1 photo_restored.png
+.venv/bin/python mspe_v11_media.py encrypt photo.png photo_encrypted.png "your-secret-key"
+.venv/bin/python mspe_v11_media.py decrypt photo_encrypted.png photo_restored.png "your-secret-key"
 ```
 
 ## 可选参数
@@ -70,7 +64,7 @@ ffmpeg -i photo_restored.mp4 -frames:v 1 photo_restored.png
 运行以下命令查看全部参数：
 
 ```bash
-.venv/bin/python mspe_v9_video.py --help
+.venv/bin/python mspe_v11_media.py --help
 ```
 
 常用参数包括帧流水线并行数、每帧傅里叶变换线程数、编码器、视频质量参数和编码预设。处理与恢复时应保持变换参数一致；默认参数已经匹配。
